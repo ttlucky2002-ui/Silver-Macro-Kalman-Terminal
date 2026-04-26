@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html import unescape
 from io import StringIO
+import re
 from typing import Iterable
 
 import feedparser
@@ -21,14 +23,28 @@ DXY_TICKER = "DX-Y.NYB"
 TNX_TICKER = "^TNX"
 FRED_REAL_RATE = "DFII10"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+TRANSLATION_URL = "https://api.mymemory.translated.net/get"
 
 SENTIMENT_WEIGHT = 0.40
 DOLLAR_WEIGHT = 0.35
 RATE_WEIGHT = 0.25
 
 NEWS_KEYWORDS = ("silver", "fed", "federal reserve", "war")
+NEWS_KEYWORD_PATTERNS = {
+    "silver": re.compile(r"\bsilver\b", re.IGNORECASE),
+    "fed": re.compile(r"\bfed\b", re.IGNORECASE),
+    "federal reserve": re.compile(r"\bfederal\s+reserve\b", re.IGNORECASE),
+    "war": re.compile(r"\bwars?\b", re.IGNORECASE),
+}
+NON_GEOPOLITICAL_WAR_TERMS = (
+    "talent war",
+    "price war",
+    "bidding war",
+    "streaming war",
+    "console war",
+    "culture war",
+)
 RSS_FEEDS = {
-    "Reuters Business": "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
     "CNBC Markets": "https://www.cnbc.com/id/15839135/device/rss/rss.html",
     "CNBC Top News": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
@@ -131,6 +147,25 @@ def first_available_column(frame: pd.DataFrame, candidates: Iterable[str]) -> pd
         if name in frame.columns:
             return pd.to_numeric(frame[name], errors="coerce")
     return pd.Series(index=frame.index, dtype=float)
+
+
+def match_news_keywords(text: str) -> list[str]:
+    return [keyword for keyword in NEWS_KEYWORDS if NEWS_KEYWORD_PATTERNS[keyword].search(text)]
+
+
+def has_geopolitical_conflict_text(text: str) -> bool:
+    if any(term in text for term in NON_GEOPOLITICAL_WAR_TERMS):
+        return False
+
+    conflict_patterns = (
+        NEWS_KEYWORD_PATTERNS["war"],
+        re.compile(r"\battack\b", re.IGNORECASE),
+        re.compile(r"\bconflicts?\b", re.IGNORECASE),
+        re.compile(r"\bgeopolitical\b", re.IGNORECASE),
+        re.compile(r"\bsanctions?\b", re.IGNORECASE),
+        re.compile(r"\btensions?\b", re.IGNORECASE),
+    )
+    return any(pattern.search(text) for pattern in conflict_patterns)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -323,8 +358,10 @@ def fetch_news_sentiment(max_items: int = 80) -> FetchResult:
             title = str(entry.get("title", "")).strip()
             summary = str(entry.get("summary", "")).strip()
             text = f"{title} {summary}".lower()
-            matched = [keyword for keyword in NEWS_KEYWORDS if keyword in text]
+            matched = match_news_keywords(text)
             if not title or not matched:
+                continue
+            if matched == ["war"] and any(term in text for term in NON_GEOPOLITICAL_WAR_TERMS):
                 continue
 
             score = analyzer.polarity_scores(title)["compound"]
@@ -333,6 +370,7 @@ def fetch_news_sentiment(max_items: int = 80) -> FetchResult:
                     "published": parse_entry_date(entry),
                     "source": source,
                     "title": title,
+                    "summary": summary,
                     "score": float(score),
                     "keyword": ", ".join(matched),
                     "link": entry.get("link", ""),
@@ -673,6 +711,270 @@ def format_news_table(news: pd.DataFrame, limit: int = 20, keyword: str | None =
     )[["发布时间", "来源", "关键词", "情绪分", "标题", "链接"]]
 
 
+def clean_news_text(value: object, max_length: int = 360) -> str:
+    text = unescape(str(value or ""))
+    replacements = {
+        "бк": "-",
+        "вЂ“": "-",
+        "вЂ”": "-",
+        "вЂ™": "'",
+        "вЂњ": '"',
+        "вЂќ": '"',
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3].rstrip() + "..."
+
+
+def contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def translate_news_text(text: str) -> str:
+    cleaned = clean_news_text(text, max_length=480)
+    if not cleaned or contains_chinese(cleaned):
+        return cleaned
+
+    try:
+        response = requests.get(
+            TRANSLATION_URL,
+            params={"q": cleaned, "langpair": "en|zh-CN"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = str(payload.get("responseData", {}).get("translatedText", "")).strip()
+        translated = clean_news_text(translated, max_length=520)
+        if translated and translated.lower() != cleaned.lower():
+            return translated
+    except Exception:
+        pass
+
+    return cleaned
+
+
+def build_chinese_news_summary(title: object, summary: object, keyword: object) -> str:
+    clean_title = clean_news_text(title, max_length=220)
+    clean_summary = clean_news_text(summary, max_length=320)
+
+    translated_title = translate_news_text(clean_title)
+    translated_summary = translate_news_text(clean_summary) if clean_summary else ""
+
+    if translated_summary and translated_summary.lower() not in translated_title.lower():
+        return f"标题：{translated_title}；摘要：{translated_summary}"
+    return f"标题：{translated_title}"
+
+
+def contains_market_term(text: str, terms: Iterable[str]) -> bool:
+    for term in terms:
+        if len(term) <= 4 and term.replace(" ", "").isalpha():
+            if re.search(rf"\b{re.escape(term)}\b", text):
+                return True
+        elif term in text:
+            return True
+    return False
+
+
+def describe_silver_impact(title: object, summary: object, keyword: object, score: float) -> str:
+    text = f"{title} {summary}".lower()
+    keyword_text = str(keyword or "").lower()
+    hawkish_terms = (
+        "rate hike",
+        "rate hikes",
+        "higher rate",
+        "higher rates",
+        "higher-for-longer",
+        "higher yield",
+        "higher yields",
+        "yield rises",
+        "yields rise",
+        "sticky inflation",
+        "strong dollar",
+        "dollar rises",
+        "tightening",
+        "tariff inflation",
+        "inflation pressure",
+        "inflationary",
+    )
+    dovish_terms = (
+        "rate cut",
+        "rate cuts",
+        "lower rate",
+        "lower rates",
+        "lower yield",
+        "lower yields",
+        "dovish",
+        "easing",
+        "weaker dollar",
+        "dollar falls",
+        "stimulus",
+    )
+    deescalation_terms = ("ceasefire", "truce", "peace deal", "de-escalation", "deescalation")
+    energy_shock_terms = (
+        "hormuz",
+        "strait of hormuz",
+        "oil",
+        "crude",
+        "brent",
+        "wti",
+        "tanker",
+        "freight",
+        "shipping",
+        "energy prices",
+        "energy stocks",
+        "gasoline",
+    )
+    inflation_terms = (
+        "inflation",
+        "cpi",
+        "ppi",
+        "price pressure",
+        "commodity prices",
+        "higher prices",
+    )
+    strong_dollar_terms = ("strong dollar", "dollar rises", "dollar strength", "greenback rises")
+    weak_dollar_terms = ("weaker dollar", "dollar falls", "dollar weakness", "greenback falls")
+    demand_terms = ("silver demand", "solar", "industrial demand", "electronics", "supply deficit")
+    weak_growth_terms = ("slowdown", "recession", "weak demand", "factory contraction")
+    has_geopolitical_conflict = has_geopolitical_conflict_text(text)
+
+    impact_score = 0.0
+    drivers: list[str] = []
+
+    if contains_market_term(text, deescalation_terms):
+        impact_score -= 0.8
+        drivers.append("冲突缓和会削弱避险买盘")
+
+    if has_geopolitical_conflict:
+        impact_score += 0.8
+        drivers.append("地缘风险会带来一定避险需求")
+
+    if has_geopolitical_conflict and contains_market_term(text, energy_shock_terms):
+        impact_score -= 2.0
+        drivers.append("霍尔木兹/油价/航运冲击可能推高能源价格和通胀，进而强化美联储维持高利率或加息的压力")
+    elif contains_market_term(text, energy_shock_terms) and contains_market_term(text, inflation_terms):
+        impact_score -= 1.5
+        drivers.append("能源价格和通胀压力上升会抬高实际利率预期，对无息白银不利")
+    elif contains_market_term(text, inflation_terms):
+        impact_score -= 0.7
+        drivers.append("通胀压力若引发更紧货币政策，会压制白银估值")
+
+    if contains_market_term(text, hawkish_terms):
+        impact_score -= 1.8
+        drivers.append("加息、高收益率或偏鹰政策会提高持有白银的机会成本")
+    if contains_market_term(text, dovish_terms):
+        impact_score += 1.8
+        drivers.append("降息、收益率下行或宽松政策会减轻贵金属的利率压力")
+
+    if contains_market_term(text, strong_dollar_terms):
+        impact_score -= 1.2
+        drivers.append("美元走强通常压制以美元计价的白银")
+    if contains_market_term(text, weak_dollar_terms):
+        impact_score += 1.2
+        drivers.append("美元走弱通常支撑以美元计价的白银")
+
+    if contains_market_term(text, demand_terms):
+        impact_score += 1.2
+        drivers.append("工业、光伏或供需缺口改善会支撑白银实物需求")
+    if contains_market_term(text, weak_growth_terms):
+        impact_score -= 1.0
+        drivers.append("经济放缓会压制白银工业需求")
+
+    if "fed" in keyword_text or "federal reserve" in text:
+        if score <= -0.20:
+            impact_score -= 0.7
+            drivers.append("美联储相关不确定性会让实际收益率路径更偏压力")
+        elif score >= 0.20:
+            impact_score += 0.5
+            drivers.append("若市场解读为更温和的美联储路径，则对白银有一定支撑")
+        else:
+            drivers.append("美联储新闻需要继续观察其对降息预期、实际收益率和美元的影响")
+    elif not drivers:
+        if score >= 0.20:
+            impact_score += 0.3
+            drivers.append("标题情绪偏正面，可能改善金属风险偏好")
+        elif score <= -0.20:
+            impact_score -= 0.3
+            drivers.append("标题情绪偏负面，可能压制周期需求预期")
+
+    if impact_score >= 1.2:
+        label = "偏多白银"
+    elif impact_score >= 0.4:
+        label = "轻微偏多白银"
+    elif impact_score <= -1.2:
+        label = "偏空白银"
+    elif impact_score <= -0.4:
+        label = "轻微偏空白银"
+    else:
+        label = "多空影响交织"
+
+    if not drivers:
+        drivers.append("新闻未明显改变利率、美元、通胀、需求或避险驱动")
+    return f"{label}：{'；'.join(drivers[:3])}。"
+
+
+def format_home_news_briefing(news: pd.DataFrame, limit: int = 12) -> pd.DataFrame:
+    columns = [
+        "时间",
+        "来源",
+        "触发词",
+        "情绪分",
+        "新闻内容（中文翻译）",
+        "对白银影响",
+        "链接",
+    ]
+    if news.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = news.head(limit).copy()
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    defaults = {
+        "published": pd.NaT,
+        "source": "",
+        "title": "",
+        "summary": "",
+        "score": 0.0,
+        "keyword": "",
+        "link": "",
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
+
+    frame["时间"] = pd.to_datetime(frame["published"]).dt.strftime("%Y-%m-%d %H:%M")
+    frame["来源"] = frame["source"]
+    frame["触发词"] = frame["keyword"]
+    frame["_score_value"] = pd.to_numeric(frame["score"], errors="coerce").fillna(0.0)
+    frame["情绪分"] = frame["_score_value"]
+    frame["新闻内容（中文翻译）"] = frame.apply(
+        lambda row: build_chinese_news_summary(
+            row.get("title", ""),
+            row.get("summary", ""),
+            row.get("keyword", ""),
+        ),
+        axis=1,
+    )
+    frame["对白银影响"] = frame.apply(
+        lambda row: describe_silver_impact(
+            row.get("title", ""),
+            row.get("summary", ""),
+            row.get("keyword", ""),
+            float(row.get("_score_value", 0.0)),
+        ),
+        axis=1,
+    )
+    frame["链接"] = frame["link"]
+    return frame[columns]
+
+
 def build_price_chart(filtered: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
@@ -981,7 +1283,7 @@ def render_sentiment_tab(news: pd.DataFrame, sentiment_daily: pd.DataFrame, macr
     st.subheader("情绪因子：新闻标题 -> VADER -> 日均值 -> Z-Score")
     st.markdown(
         f"""
-        1. 从 Reuters、CNBC、Yahoo Finance、Google News RSS 抓取包含 `Silver / Fed / War` 的标题。
+        1. 从 CNBC、Yahoo Finance、Google News RSS 抓取包含 `Silver / Fed / War` 的标题。
         2. 使用 VADER `compound` 得到每条标题的情绪分，范围为 `-1` 到 `1`。
         3. 按日期求平均，得到 `sentiment_raw`。
         4. 对 `sentiment_raw` 做 EWM Z-Score，得到 `z_sentiment`（近期权重更高）。
@@ -1264,12 +1566,26 @@ def main() -> None:
     c5.metric("隐藏动量", f"{latest_row['velocity']:,.3f}")
     c6.metric("宏观总分 U_score", f"{latest_row['U_score']:,.2f}")
 
+    with st.expander("卡尔曼价格是什么意思？", expanded=False):
+        st.markdown(
+            f"""
+            **卡尔曼价格不是实时成交价，也不是目标价。** 它是模型根据历史 `SI=F` 价格、
+            宏观总分 `U_score` 和近期波动状态估计出的“去噪趋势价格”。
+
+            可以把它理解为当前白银价格的动态平滑中枢：实际价格高于卡尔曼价格，
+            说明价格站在模型趋势线上方；实际价格低于卡尔曼价格，说明价格弱于模型趋势中枢。
+            本页会把它和“隐藏动量”一起使用，用来判断多空窗口，而不是单独给出买卖结论。
+
+            当前显示的 `{latest_row['kalman_price']:,.2f}` 表示模型对最新时点白银期货趋势价格的估计。
+            """
+        )
+
     if all_warnings:
         with st.expander("数据源告警", expanded=False):
             render_warnings(all_warnings)
 
-    st.subheader("相关新闻")
-    home_news = format_news_table(news.data, limit=12)
+    st.subheader("相关新闻中文翻译与白银影响")
+    home_news = format_home_news_briefing(news.data, limit=12)
     if home_news.empty:
         st.info("当前没有可展示的相关新闻。")
     else:
