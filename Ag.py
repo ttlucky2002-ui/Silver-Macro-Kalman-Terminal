@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from io import StringIO
 from typing import Iterable
 
 import feedparser
@@ -11,7 +12,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-from pandas_datareader.fred import FredReader
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 
@@ -20,6 +20,7 @@ SILVER_TICKER = "SI=F"
 DXY_TICKER = "DX-Y.NYB"
 TNX_TICKER = "^TNX"
 FRED_REAL_RATE = "DFII10"
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
 SENTIMENT_WEIGHT = 0.40
 DOLLAR_WEIGHT = 0.35
@@ -254,23 +255,36 @@ def fetch_latest_silver_price() -> tuple[float | None, str | None]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_rate(start: datetime, end: datetime) -> FetchResult:
-    try:
-        reader = FredReader(
-            symbols=FRED_REAL_RATE,
-            start=start,
-            end=end,
-            retry_count=2,
-            pause=0.2,
-            timeout=10,
+    params = {
+        "id": FRED_REAL_RATE,
+        "cosd": start.strftime("%Y-%m-%d"),
+        "coed": end.strftime("%Y-%m-%d"),
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 Silver-Macro-Kalman-Terminal "
+            "(FRED CSV request; contact: local)"
         )
-        data = reader.read()
+    }
+
+    try:
+        response = requests.get(FRED_CSV_URL, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = pd.read_csv(StringIO(response.text), na_values=["."])
     except Exception as exc:
         return FetchResult(pd.DataFrame(), [f"FRED 实际利率下载失败：{exc}"])
 
-    if data.empty:
-        return FetchResult(pd.DataFrame(), ["FRED 未返回实际利率数据。"])
+    date_column = "DATE" if "DATE" in data.columns else "observation_date"
+    if data.empty or date_column not in data.columns or FRED_REAL_RATE not in data.columns:
+        return FetchResult(pd.DataFrame(), ["FRED 未返回可解析的实际利率数据。"])
 
+    data[date_column] = pd.to_datetime(data[date_column], errors="coerce")
+    data[FRED_REAL_RATE] = pd.to_numeric(data[FRED_REAL_RATE], errors="coerce")
+    data = data.dropna(subset=[date_column]).set_index(date_column)[[FRED_REAL_RATE]]
     data = normalize_index(data)
+    if data[FRED_REAL_RATE].dropna().empty:
+        return FetchResult(pd.DataFrame(), ["FRED 实际利率数据为空。"])
+
     return FetchResult(data, [])
 
 
