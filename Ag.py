@@ -689,26 +689,54 @@ def current_trade_plan(signal_frame: pd.DataFrame, latest_quote: float) -> dict[
 
 
 def format_news_table(news: pd.DataFrame, limit: int = 20, keyword: str | None = None) -> pd.DataFrame:
+    columns = ["发布时间", "来源", "关键词", "情绪分", "新闻内容（中文翻译）", "对白银影响", "链接"]
     if news.empty:
-        return pd.DataFrame(columns=["发布时间", "来源", "关键词", "情绪分", "标题", "链接"])
+        return pd.DataFrame(columns=columns)
 
     frame = news.copy()
     if keyword:
         frame = frame[frame["keyword"].str.contains(keyword, case=False, na=False)]
     frame = frame.head(limit).copy()
     if frame.empty:
-        return pd.DataFrame(columns=["发布时间", "来源", "关键词", "情绪分", "标题", "链接"])
+        return pd.DataFrame(columns=columns)
+
+    defaults = {
+        "published": pd.NaT,
+        "source": "",
+        "title": "",
+        "summary": "",
+        "score": 0.0,
+        "keyword": "",
+        "link": "",
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
 
     frame["发布时间"] = pd.to_datetime(frame["published"]).dt.strftime("%Y-%m-%d %H:%M")
-    return frame.rename(
-        columns={
-            "source": "来源",
-            "keyword": "关键词",
-            "score": "情绪分",
-            "title": "标题",
-            "link": "链接",
-        }
-    )[["发布时间", "来源", "关键词", "情绪分", "标题", "链接"]]
+    frame["来源"] = frame["source"]
+    frame["关键词"] = frame["keyword"]
+    frame["_score_value"] = pd.to_numeric(frame["score"], errors="coerce").fillna(0.0)
+    frame["情绪分"] = frame["_score_value"]
+    frame["新闻内容（中文翻译）"] = frame.apply(
+        lambda row: build_chinese_news_summary(
+            row.get("title", ""),
+            row.get("summary", ""),
+            row.get("keyword", ""),
+        ),
+        axis=1,
+    )
+    frame["对白银影响"] = frame.apply(
+        lambda row: describe_silver_impact(
+            row.get("title", ""),
+            row.get("summary", ""),
+            row.get("keyword", ""),
+            float(row.get("_score_value", 0.0)),
+        ),
+        axis=1,
+    )
+    frame["链接"] = frame["link"]
+    return frame[columns]
 
 
 def clean_news_text(value: object, max_length: int = 360) -> str:
