@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from html import unescape
+from html import escape, unescape
 from io import StringIO
 import re
 from typing import Iterable
+from urllib.parse import quote
 
 import feedparser
 import numpy as np
@@ -22,19 +23,65 @@ SILVER_TICKER = "SI=F"
 DXY_TICKER = "DX-Y.NYB"
 TNX_TICKER = "^TNX"
 FRED_REAL_RATE = "DFII10"
+FRED_DOLLAR_INDEX = "DTWEXBGS"
+FRED_TREASURY_10Y = "DGS10"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 TRANSLATION_URL = "https://api.mymemory.translated.net/get"
+GOOGLE_TRANSLATION_URL = "https://translate.googleapis.com/translate_a/single"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+DATA_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 Silver-Macro-Kalman-Terminal "
+        "(local research dashboard; contact: local)"
+    )
+}
+INTRADAY_MAX_PERIOD = "2y"
+LIVE_QUOTE_REFRESH_SECONDS = 2
+HOME_NEWS_PAGE_SIZE = 10
+NEWS_FETCH_ITEMS_PER_SOURCE = 160
+YAHOO_VALUE_MULTIPLIERS: dict[str, float] = {}
 
 SENTIMENT_WEIGHT = 0.40
 DOLLAR_WEIGHT = 0.35
 RATE_WEIGHT = 0.25
 
-NEWS_KEYWORDS = ("silver", "fed", "federal reserve", "war")
+NEWS_KEYWORDS = (
+    "silver",
+    "fed",
+    "federal reserve",
+    "war",
+    "industrial demand",
+    "solar",
+    "photovoltaic",
+    "electronics",
+    "semiconductor",
+    "electric vehicle",
+    "battery",
+    "supply deficit",
+)
 NEWS_KEYWORD_PATTERNS = {
     "silver": re.compile(r"\bsilver\b", re.IGNORECASE),
     "fed": re.compile(r"\bfed\b", re.IGNORECASE),
     "federal reserve": re.compile(r"\bfederal\s+reserve\b", re.IGNORECASE),
     "war": re.compile(r"\bwars?\b", re.IGNORECASE),
+    "industrial demand": re.compile(r"\bindustrial\s+demand\b", re.IGNORECASE),
+    "solar": re.compile(r"\bsolar\b", re.IGNORECASE),
+    "photovoltaic": re.compile(r"\bphotovoltaics?\b|\bPV\b", re.IGNORECASE),
+    "electronics": re.compile(r"\belectronics?\b|\belectrical\b", re.IGNORECASE),
+    "semiconductor": re.compile(r"\bsemiconductors?\b|\bchips?\b", re.IGNORECASE),
+    "electric vehicle": re.compile(r"\belectric\s+vehicles?\b|\bEVs?\b", re.IGNORECASE),
+    "battery": re.compile(r"\bbatter(?:y|ies)\b", re.IGNORECASE),
+    "supply deficit": re.compile(r"\bsupply\s+deficits?\b|\bsilver\s+shortage\b", re.IGNORECASE),
+}
+INDUSTRIAL_NEWS_KEYWORDS = {
+    "industrial demand",
+    "solar",
+    "photovoltaic",
+    "electronics",
+    "semiconductor",
+    "electric vehicle",
+    "battery",
+    "supply deficit",
 }
 NON_GEOPOLITICAL_WAR_TERMS = (
     "talent war",
@@ -52,6 +99,11 @@ RSS_FEEDS = {
         "https://news.google.com/rss/search?"
         "q=silver%20OR%20Fed%20OR%20war%20when:7d&hl=en-US&gl=US&ceid=US:en"
     ),
+    "Google News Silver Industry": (
+        "https://news.google.com/rss/search?"
+        f"q={quote('(silver industrial demand) OR (silver solar) OR (photovoltaic silver) OR (silver electronics) OR (silver supply deficit) when:14d')}"
+        "&hl=en-US&gl=US&ceid=US:en"
+    ),
 }
 
 
@@ -59,6 +111,14 @@ RSS_FEEDS = {
 class FetchResult:
     data: pd.DataFrame
     warnings: list[str]
+
+
+@dataclass
+class QuoteResult:
+    price: float | None
+    timestamp: datetime | None
+    source: str
+    warning: str | None = None
 
 
 class MacroKalman2D:
@@ -153,6 +213,32 @@ def match_news_keywords(text: str) -> list[str]:
     return [keyword for keyword in NEWS_KEYWORDS if NEWS_KEYWORD_PATTERNS[keyword].search(text)]
 
 
+def classify_news_category(matched_keywords: Iterable[str], text: str) -> str:
+    matched = {keyword.lower() for keyword in matched_keywords}
+    if matched & INDUSTRIAL_NEWS_KEYWORDS:
+        return "工业相关"
+
+    industrial_terms = (
+        "industrial",
+        "solar",
+        "photovoltaic",
+        "electronics",
+        "semiconductor",
+        "chip",
+        "electric vehicle",
+        "ev",
+        "battery",
+        "grid",
+        "electrification",
+        "supply deficit",
+        "silver shortage",
+    )
+    if any(term in text for term in industrial_terms):
+        return "工业相关"
+
+    return "宏观/其他"
+
+
 def has_geopolitical_conflict_text(text: str) -> bool:
     if any(term in text for term in NON_GEOPOLITICAL_WAR_TERMS):
         return False
@@ -168,8 +254,173 @@ def has_geopolitical_conflict_text(text: str) -> bool:
     return any(pattern.search(text) for pattern in conflict_patterns)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_market_data(period: str, interval: str) -> FetchResult:
+def normalize_yahoo_period(period: str, interval: str) -> tuple[str, str | None]:
+    if interval != "1d" and period in {"5y", "10y"}:
+        return INTRADAY_MAX_PERIOD, f"Yahoo Chart 小时线最多稳定请求约 {INTRADAY_MAX_PERIOD}，已将 {period} 小时线窗口改为 {INTRADAY_MAX_PERIOD}。"
+    return period, None
+
+
+def request_yahoo_chart(symbol: str, period: str, interval: str) -> tuple[pd.DataFrame, dict[str, object]]:
+    request_period, _ = normalize_yahoo_period(period, interval)
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=quote(symbol, safe="")),
+        params={
+            "range": request_period,
+            "interval": interval,
+            "includePrePost": "false",
+            "events": "history",
+        },
+        headers=DATA_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart", {})
+    error = chart.get("error")
+    if error:
+        description = error.get("description") if isinstance(error, dict) else str(error)
+        raise RuntimeError(description)
+
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError("Yahoo Chart 未返回 result。")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quote_data = (result.get("indicators", {}).get("quote") or [{}])[0]
+    if not timestamps or not quote_data:
+        raise RuntimeError("Yahoo Chart 未返回可解析的时间序列。")
+
+    index = pd.to_datetime(timestamps, unit="s", utc=True)
+    timezone = str(result.get("meta", {}).get("exchangeTimezoneName") or "UTC")
+    try:
+        index = index.tz_convert(timezone).tz_localize(None)
+    except Exception:
+        index = index.tz_localize(None)
+
+    data = pd.DataFrame(
+        {
+            "Open": quote_data.get("open", []),
+            "High": quote_data.get("high", []),
+            "Low": quote_data.get("low", []),
+            "Close": quote_data.get("close", []),
+            "Volume": quote_data.get("volume", []),
+        },
+        index=index,
+    )
+    for column in data.columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    multiplier = YAHOO_VALUE_MULTIPLIERS.get(symbol, 1.0)
+    if multiplier != 1.0:
+        for column in ["Open", "High", "Low", "Close"]:
+            data[column] = data[column] * multiplier
+
+    data = normalize_index(data).dropna(subset=["Close"])
+    return data, dict(result.get("meta", {}))
+
+
+def fetch_yahoo_close_frame(symbol: str, column_name: str, period: str, interval: str) -> FetchResult:
+    warnings: list[str] = []
+    _, period_warning = normalize_yahoo_period(period, interval)
+    if period_warning:
+        warnings.append(period_warning)
+
+    try:
+        data, _ = request_yahoo_chart(symbol, period, interval)
+    except Exception as exc:
+        return FetchResult(pd.DataFrame(), warnings + [f"Yahoo Chart 获取 {symbol} 失败：{exc}"])
+
+    if data.empty or data["Close"].dropna().empty:
+        return FetchResult(pd.DataFrame(), warnings + [f"Yahoo Chart 未返回 {symbol} 可用收盘价。"])
+
+    return FetchResult(data[["Close"]].rename(columns={"Close": column_name}), warnings)
+
+
+def fetch_fred_series(
+    series_id: str,
+    start: datetime,
+    end: datetime,
+    column_name: str | None = None,
+) -> FetchResult:
+    output_name = column_name or series_id
+    params = {
+        "id": series_id,
+        "cosd": start.strftime("%Y-%m-%d"),
+        "coed": end.strftime("%Y-%m-%d"),
+    }
+
+    try:
+        response = requests.get(FRED_CSV_URL, params=params, headers=DATA_HEADERS, timeout=15)
+        response.raise_for_status()
+        data = pd.read_csv(StringIO(response.text), na_values=["."])
+    except Exception as exc:
+        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 下载失败：{exc}"])
+
+    date_column = "DATE" if "DATE" in data.columns else "observation_date"
+    if data.empty or date_column not in data.columns or series_id not in data.columns:
+        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 未返回可解析数据。"])
+
+    data[date_column] = pd.to_datetime(data[date_column], errors="coerce")
+    data[series_id] = pd.to_numeric(data[series_id], errors="coerce")
+    data = data.dropna(subset=[date_column]).set_index(date_column)[[series_id]]
+    data = normalize_index(data.rename(columns={series_id: output_name}))
+    if data[output_name].dropna().empty:
+        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 数据为空。"])
+
+    return FetchResult(data, [])
+
+
+def align_to_index(frame: pd.DataFrame, column: str, index: pd.Index) -> pd.Series:
+    if frame.empty or column not in frame.columns:
+        return pd.Series(index=index, dtype=float)
+
+    series = pd.to_numeric(frame[column], errors="coerce").dropna()
+    if series.empty:
+        return pd.Series(index=index, dtype=float)
+
+    series = series[~series.index.duplicated(keep="last")].sort_index()
+    return series.reindex(index, method="ffill")
+
+
+def dedupe_warnings(warnings: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for warning in warnings:
+        if warning and warning not in seen:
+            result.append(warning)
+            seen.add(warning)
+    return result
+
+
+def yahoo_market_timestamp(meta: dict[str, object]) -> datetime | None:
+    timestamp = meta.get("regularMarketTime")
+    if timestamp is None or pd.isna(timestamp):
+        return None
+
+    try:
+        return pd.Timestamp(float(timestamp), unit="s", utc=True).tz_convert("Asia/Shanghai").to_pydatetime()
+    except Exception:
+        return None
+
+
+def current_timestamp() -> datetime:
+    return pd.Timestamp.now(tz="Asia/Shanghai").to_pydatetime()
+
+
+def format_quote_timestamp(value: datetime | None) -> str:
+    if value is None or pd.isna(value):
+        return "暂无"
+
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("Asia/Shanghai")
+    else:
+        timestamp = timestamp.tz_convert("Asia/Shanghai")
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fetch_yfinance_market_data(period: str, interval: str) -> FetchResult:
     warnings: list[str] = []
     tickers = [SILVER_TICKER, DXY_TICKER, TNX_TICKER]
 
@@ -184,10 +435,10 @@ def fetch_market_data(period: str, interval: str) -> FetchResult:
             timeout=20,
         )
     except Exception as exc:
-        return FetchResult(pd.DataFrame(), [f"yfinance 行情下载失败：{exc}"])
+        return FetchResult(pd.DataFrame(), [f"yfinance 备用行情下载失败：{exc}"])
 
     if raw.empty:
-        return FetchResult(pd.DataFrame(), ["yfinance 未返回可用行情数据。"])
+        return FetchResult(pd.DataFrame(), ["yfinance 备用行情未返回可用数据。"])
 
     try:
         if isinstance(raw.columns, pd.MultiIndex):
@@ -196,18 +447,17 @@ def fetch_market_data(period: str, interval: str) -> FetchResult:
         else:
             close = raw[["Close"]].rename(columns={"Close": SILVER_TICKER})
     except Exception as exc:
-        return FetchResult(pd.DataFrame(), [f"无法解析 yfinance 收盘价数据：{exc}"])
+        return FetchResult(pd.DataFrame(), [f"无法解析 yfinance 备用收盘价数据：{exc}"])
 
     close = normalize_index(close)
     for ticker in tickers:
         if ticker not in close.columns or close[ticker].dropna().empty:
-            warnings.append(f"yfinance 缺失或返回空数据：{ticker}")
+            warnings.append(f"yfinance 备用源缺失或返回空数据：{ticker}")
 
     return FetchResult(close, warnings)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_silver_ohlc(period: str, interval: str) -> FetchResult:
+def fetch_yfinance_silver_ohlc(period: str, interval: str) -> FetchResult:
     try:
         raw = yf.download(
             tickers=SILVER_TICKER,
@@ -219,10 +469,10 @@ def fetch_silver_ohlc(period: str, interval: str) -> FetchResult:
             timeout=20,
         )
     except Exception as exc:
-        return FetchResult(pd.DataFrame(), [f"SI=F OHLC download failed: {exc}"])
+        return FetchResult(pd.DataFrame(), [f"yfinance 备用 SI=F OHLC 下载失败：{exc}"])
 
     if raw.empty:
-        return FetchResult(pd.DataFrame(), ["SI=F OHLC is empty."])
+        return FetchResult(pd.DataFrame(), ["yfinance 备用 SI=F OHLC 为空。"])
 
     if isinstance(raw.columns, pd.MultiIndex):
         ohlc = raw.droplevel(1, axis=1).copy()
@@ -232,10 +482,97 @@ def fetch_silver_ohlc(period: str, interval: str) -> FetchResult:
     required = ["Open", "High", "Low", "Close"]
     missing = [name for name in required if name not in ohlc.columns]
     if missing:
-        return FetchResult(pd.DataFrame(), [f"SI=F OHLC missing fields: {', '.join(missing)}"])
+        return FetchResult(pd.DataFrame(), [f"yfinance 备用 SI=F OHLC 缺少字段：{', '.join(missing)}"])
 
-    cleaned = normalize_index(ohlc[required].copy())
+    cleaned = normalize_index(ohlc[required].copy()).dropna(subset=["Close"])
     return FetchResult(cleaned, [])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_market_data(period: str, interval: str) -> FetchResult:
+    warnings: list[str] = []
+    silver = fetch_yahoo_close_frame(SILVER_TICKER, SILVER_TICKER, period, interval)
+    warnings.extend(silver.warnings)
+
+    if silver.data.empty:
+        fallback = fetch_yfinance_market_data(period, interval)
+        fallback.warnings = dedupe_warnings(
+            silver.warnings + ["Yahoo Chart 主行情源不可用，已尝试 yfinance 备用源。"] + fallback.warnings
+        )
+        return fallback
+
+    result = pd.DataFrame(index=silver.data.index)
+    result[SILVER_TICKER] = pd.to_numeric(silver.data[SILVER_TICKER], errors="coerce")
+    start = result.index.min().to_pydatetime() - timedelta(days=10)
+    end = result.index.max().to_pydatetime() + timedelta(days=1)
+
+    if interval == "1d":
+        dollar = fetch_fred_series(FRED_DOLLAR_INDEX, start, end, DXY_TICKER)
+        rate = fetch_fred_series(FRED_TREASURY_10Y, start, end, TNX_TICKER)
+
+        if dollar.data.empty:
+            warnings.extend(dollar.warnings)
+            dollar = fetch_yahoo_close_frame(DXY_TICKER, DXY_TICKER, period, interval)
+        if rate.data.empty:
+            warnings.extend(rate.warnings)
+            rate = fetch_yahoo_close_frame(TNX_TICKER, TNX_TICKER, period, interval)
+    else:
+        dollar = fetch_yahoo_close_frame(DXY_TICKER, DXY_TICKER, period, interval)
+        rate = fetch_yahoo_close_frame(TNX_TICKER, TNX_TICKER, period, interval)
+
+        if dollar.data.empty:
+            warnings.extend(dollar.warnings)
+            dollar = fetch_fred_series(FRED_DOLLAR_INDEX, start, end, DXY_TICKER)
+        if rate.data.empty:
+            warnings.extend(rate.warnings)
+            rate = fetch_fred_series(FRED_TREASURY_10Y, start, end, TNX_TICKER)
+
+    warnings.extend(dollar.warnings)
+    warnings.extend(rate.warnings)
+    result[DXY_TICKER] = align_to_index(dollar.data, DXY_TICKER, result.index)
+    result[TNX_TICKER] = align_to_index(rate.data, TNX_TICKER, result.index)
+    result = normalize_index(result)
+
+    for ticker in [SILVER_TICKER, DXY_TICKER, TNX_TICKER]:
+        if ticker not in result.columns or result[ticker].dropna().empty:
+            warnings.append(f"行情源缺失或返回空数据：{ticker}")
+
+    if result[SILVER_TICKER].dropna().empty:
+        fallback = fetch_yfinance_market_data(period, interval)
+        fallback.warnings = dedupe_warnings(
+            warnings + ["主行情源清洗后没有可用白银价格，已尝试 yfinance 备用源。"] + fallback.warnings
+        )
+        return fallback
+
+    return FetchResult(result, dedupe_warnings(warnings))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_silver_ohlc(period: str, interval: str) -> FetchResult:
+    warnings: list[str] = []
+    _, period_warning = normalize_yahoo_period(period, interval)
+    if period_warning:
+        warnings.append(period_warning)
+
+    try:
+        data, _ = request_yahoo_chart(SILVER_TICKER, period, interval)
+    except Exception as exc:
+        fallback = fetch_yfinance_silver_ohlc(period, interval)
+        fallback.warnings = dedupe_warnings(
+            warnings + [f"Yahoo Chart SI=F OHLC 获取失败，已尝试 yfinance 备用源：{exc}"] + fallback.warnings
+        )
+        return fallback
+
+    required = ["Open", "High", "Low", "Close"]
+    cleaned = normalize_index(data[required].copy()).dropna(subset=["Close"])
+    if cleaned.empty:
+        fallback = fetch_yfinance_silver_ohlc(period, interval)
+        fallback.warnings = dedupe_warnings(
+            warnings + ["Yahoo Chart SI=F OHLC 清洗后为空，已尝试 yfinance 备用源。"] + fallback.warnings
+        )
+        return fallback
+
+    return FetchResult(cleaned, dedupe_warnings(warnings))
 
 
 def calculate_adx(ohlc: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -269,58 +606,49 @@ def calculate_adx(ohlc: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx.replace([np.inf, -np.inf], np.nan)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_latest_silver_price() -> tuple[float | None, str | None]:
+@st.cache_data(ttl=LIVE_QUOTE_REFRESH_SECONDS, show_spinner=False)
+def fetch_latest_silver_price() -> QuoteResult:
+    primary_warning: str | None = None
+    try:
+        intraday, meta = request_yahoo_chart(SILVER_TICKER, "1d", "1m")
+        market_price = meta.get("regularMarketPrice")
+        if market_price is not None and not pd.isna(market_price):
+            return QuoteResult(float(market_price), yahoo_market_timestamp(meta) or current_timestamp(), "Yahoo Chart")
+        if not intraday.empty and "Close" in intraday:
+            latest_close = intraday["Close"].dropna()
+            if not latest_close.empty:
+                return QuoteResult(float(latest_close.iloc[-1]), intraday.index[-1].to_pydatetime(), "Yahoo Chart")
+    except Exception as exc:
+        primary_warning = f"Yahoo Chart 白银实时报价获取失败：{exc}"
+
     try:
         ticker = yf.Ticker(SILVER_TICKER)
         fast_info = getattr(ticker, "fast_info", None)
         if fast_info:
             last_price = fast_info.get("last_price")
             if last_price is not None and not pd.isna(last_price):
-                return float(last_price), None
-
+                return QuoteResult(float(last_price), current_timestamp(), "yfinance fast_info", primary_warning)
         intraday = ticker.history(period="1d", interval="1m", timeout=10)
         if not intraday.empty and "Close" in intraday:
-            return float(intraday["Close"].dropna().iloc[-1]), None
+            latest_close = intraday["Close"].dropna()
+            if not latest_close.empty:
+                timestamp = latest_close.index[-1]
+                if hasattr(timestamp, "to_pydatetime"):
+                    timestamp = timestamp.to_pydatetime()
+                return QuoteResult(float(latest_close.iloc[-1]), timestamp, "yfinance history", primary_warning)
     except Exception as exc:
-        return None, f"白银实时报价获取失败：{exc}"
+        if primary_warning:
+            return QuoteResult(None, None, "不可用", f"{primary_warning}；yfinance 备用实时报价获取失败：{exc}")
+        return QuoteResult(None, None, "不可用", f"白银实时报价获取失败：{exc}")
 
-    return None, "白银实时报价暂不可用。"
+    if primary_warning:
+        return QuoteResult(None, None, "不可用", f"{primary_warning}；yfinance 备用实时报价暂不可用。")
+    return QuoteResult(None, None, "不可用", "白银实时报价暂不可用。")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_rate(start: datetime, end: datetime) -> FetchResult:
-    params = {
-        "id": FRED_REAL_RATE,
-        "cosd": start.strftime("%Y-%m-%d"),
-        "coed": end.strftime("%Y-%m-%d"),
-    }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 Silver-Macro-Kalman-Terminal "
-            "(FRED CSV request; contact: local)"
-        )
-    }
-
-    try:
-        response = requests.get(FRED_CSV_URL, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = pd.read_csv(StringIO(response.text), na_values=["."])
-    except Exception as exc:
-        return FetchResult(pd.DataFrame(), [f"FRED 实际利率下载失败：{exc}"])
-
-    date_column = "DATE" if "DATE" in data.columns else "observation_date"
-    if data.empty or date_column not in data.columns or FRED_REAL_RATE not in data.columns:
-        return FetchResult(pd.DataFrame(), ["FRED 未返回可解析的实际利率数据。"])
-
-    data[date_column] = pd.to_datetime(data[date_column], errors="coerce")
-    data[FRED_REAL_RATE] = pd.to_numeric(data[FRED_REAL_RATE], errors="coerce")
-    data = data.dropna(subset=[date_column]).set_index(date_column)[[FRED_REAL_RATE]]
-    data = normalize_index(data)
-    if data[FRED_REAL_RATE].dropna().empty:
-        return FetchResult(pd.DataFrame(), ["FRED 实际利率数据为空。"])
-
-    return FetchResult(data, [])
+    return fetch_fred_series(FRED_REAL_RATE, start, end, FRED_REAL_RATE)
 
 
 def parse_entry_date(entry: dict) -> pd.Timestamp:
@@ -334,7 +662,7 @@ def parse_entry_date(entry: dict) -> pd.Timestamp:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_news_sentiment(max_items: int = 80) -> FetchResult:
+def fetch_news_sentiment(max_items: int = NEWS_FETCH_ITEMS_PER_SOURCE) -> FetchResult:
     warnings: list[str] = []
     analyzer = SentimentIntensityAnalyzer()
     rows: list[dict[str, object]] = []
@@ -373,6 +701,7 @@ def fetch_news_sentiment(max_items: int = 80) -> FetchResult:
                     "summary": summary,
                     "score": float(score),
                     "keyword": ", ".join(matched),
+                    "category": classify_news_category(matched, text),
                     "link": entry.get("link", ""),
                 }
             )
@@ -381,6 +710,8 @@ def fetch_news_sentiment(max_items: int = 80) -> FetchResult:
     if frame.empty:
         return FetchResult(frame, warnings + ["未找到匹配关键词的 RSS 新闻标题。"])
 
+    frame["_dedupe_key"] = frame["link"].replace("", np.nan).fillna(frame["title"].str.lower().str.strip())
+    frame = frame.drop_duplicates("_dedupe_key", keep="first").drop(columns=["_dedupe_key"])
     frame = frame.sort_values("published", ascending=False).reset_index(drop=True)
     return FetchResult(frame, warnings)
 
@@ -689,7 +1020,7 @@ def current_trade_plan(signal_frame: pd.DataFrame, latest_quote: float) -> dict[
 
 
 def format_news_table(news: pd.DataFrame, limit: int = 20, keyword: str | None = None) -> pd.DataFrame:
-    columns = ["发布时间", "来源", "关键词", "情绪分", "新闻内容（中文翻译）", "对白银影响", "链接"]
+    columns = ["发布时间", "类别", "来源", "关键词", "情绪分", "新闻内容（中文翻译）", "对白银影响", "链接"]
     if news.empty:
         return pd.DataFrame(columns=columns)
 
@@ -707,6 +1038,7 @@ def format_news_table(news: pd.DataFrame, limit: int = 20, keyword: str | None =
         "summary": "",
         "score": 0.0,
         "keyword": "",
+        "category": "宏观/其他",
         "link": "",
     }
     for column, default in defaults.items():
@@ -714,6 +1046,7 @@ def format_news_table(news: pd.DataFrame, limit: int = 20, keyword: str | None =
             frame[column] = default
 
     frame["发布时间"] = pd.to_datetime(frame["published"]).dt.strftime("%Y-%m-%d %H:%M")
+    frame["类别"] = frame["category"].fillna("宏观/其他")
     frame["来源"] = frame["source"]
     frame["关键词"] = frame["keyword"]
     frame["_score_value"] = pd.to_numeric(frame["score"], errors="coerce").fillna(0.0)
@@ -763,9 +1096,42 @@ def contains_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
+def parse_google_translation(payload: object) -> str:
+    if not isinstance(payload, list) or not payload:
+        return ""
+
+    chunks: list[str] = []
+    first_block = payload[0]
+    if not isinstance(first_block, list):
+        return ""
+
+    for item in first_block:
+        if isinstance(item, list) and item:
+            chunks.append(str(item[0] or ""))
+
+    return clean_news_text("".join(chunks), max_length=1400)
+
+
+def translate_with_google(text: str, max_length: int) -> str:
+    response = requests.get(
+        GOOGLE_TRANSLATION_URL,
+        params={
+            "client": "gtx",
+            "sl": "auto",
+            "tl": "zh-CN",
+            "dt": "t",
+            "q": text,
+        },
+        headers=DATA_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    return clean_news_text(parse_google_translation(response.json()), max_length=max_length)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def translate_news_text(text: str) -> str:
-    cleaned = clean_news_text(text, max_length=480)
+def translate_news_text(text: str, max_length: int = 520) -> str:
+    cleaned = clean_news_text(text, max_length=max_length)
     if not cleaned or contains_chinese(cleaned):
         return cleaned
 
@@ -778,8 +1144,15 @@ def translate_news_text(text: str) -> str:
         response.raise_for_status()
         payload = response.json()
         translated = str(payload.get("responseData", {}).get("translatedText", "")).strip()
-        translated = clean_news_text(translated, max_length=520)
-        if translated and translated.lower() != cleaned.lower():
+        translated = clean_news_text(translated, max_length=max_length)
+        if translated and contains_chinese(translated) and translated.lower() != cleaned.lower():
+            return translated
+    except Exception:
+        pass
+
+    try:
+        translated = translate_with_google(cleaned, max_length=max_length)
+        if translated and contains_chinese(translated):
             return translated
     except Exception:
         pass
@@ -788,11 +1161,11 @@ def translate_news_text(text: str) -> str:
 
 
 def build_chinese_news_summary(title: object, summary: object, keyword: object) -> str:
-    clean_title = clean_news_text(title, max_length=220)
-    clean_summary = clean_news_text(summary, max_length=320)
+    clean_title = clean_news_text(title, max_length=600)
+    clean_summary = clean_news_text(summary, max_length=1200)
 
-    translated_title = translate_news_text(clean_title)
-    translated_summary = translate_news_text(clean_summary) if clean_summary else ""
+    translated_title = translate_news_text(clean_title, max_length=700)
+    translated_summary = translate_news_text(clean_summary, max_length=1200) if clean_summary else ""
 
     if translated_summary and translated_summary.lower() not in translated_title.lower():
         return f"标题：{translated_title}；摘要：{translated_summary}"
@@ -868,7 +1241,26 @@ def describe_silver_impact(title: object, summary: object, keyword: object, scor
     )
     strong_dollar_terms = ("strong dollar", "dollar rises", "dollar strength", "greenback rises")
     weak_dollar_terms = ("weaker dollar", "dollar falls", "dollar weakness", "greenback falls")
-    demand_terms = ("silver demand", "solar", "industrial demand", "electronics", "supply deficit")
+    demand_terms = (
+        "silver demand",
+        "solar",
+        "photovoltaic",
+        "pv module",
+        "industrial demand",
+        "electronics",
+        "electrical",
+        "semiconductor",
+        "chip",
+        "electric vehicle",
+        "ev",
+        "battery",
+        "grid",
+        "electrification",
+        "conductive",
+        "conductivity",
+        "supply deficit",
+        "silver shortage",
+    )
     weak_growth_terms = ("slowdown", "recession", "weak demand", "factory contraction")
     has_geopolitical_conflict = has_geopolitical_conflict_text(text)
 
@@ -909,7 +1301,7 @@ def describe_silver_impact(title: object, summary: object, keyword: object, scor
 
     if contains_market_term(text, demand_terms):
         impact_score += 1.2
-        drivers.append("工业、光伏或供需缺口改善会支撑白银实物需求")
+        drivers.append("工业、光伏、电子、电动车或供需缺口改善会支撑白银实物需求")
     if contains_market_term(text, weak_growth_terms):
         impact_score -= 1.0
         drivers.append("经济放缓会压制白银工业需求")
@@ -947,20 +1339,23 @@ def describe_silver_impact(title: object, summary: object, keyword: object, scor
     return f"{label}：{'；'.join(drivers[:3])}。"
 
 
-def format_home_news_briefing(news: pd.DataFrame, limit: int = 12) -> pd.DataFrame:
+def format_home_news_briefing(news: pd.DataFrame, limit: int = HOME_NEWS_PAGE_SIZE, offset: int = 0) -> pd.DataFrame:
     columns = [
+        "主要内容（中文翻译）",
+        "对白银影响",
         "时间",
+        "类别",
         "来源",
         "触发词",
         "情绪分",
-        "新闻内容（中文翻译）",
-        "对白银影响",
         "链接",
     ]
     if news.empty:
         return pd.DataFrame(columns=columns)
 
-    frame = news.head(limit).copy()
+    start = max(int(offset), 0)
+    end = start + max(int(limit), 1)
+    frame = news.iloc[start:end].copy()
     if frame.empty:
         return pd.DataFrame(columns=columns)
 
@@ -971,6 +1366,7 @@ def format_home_news_briefing(news: pd.DataFrame, limit: int = 12) -> pd.DataFra
         "summary": "",
         "score": 0.0,
         "keyword": "",
+        "category": "宏观/其他",
         "link": "",
     }
     for column, default in defaults.items():
@@ -978,11 +1374,12 @@ def format_home_news_briefing(news: pd.DataFrame, limit: int = 12) -> pd.DataFra
             frame[column] = default
 
     frame["时间"] = pd.to_datetime(frame["published"]).dt.strftime("%Y-%m-%d %H:%M")
+    frame["类别"] = frame["category"].fillna("宏观/其他")
     frame["来源"] = frame["source"]
     frame["触发词"] = frame["keyword"]
     frame["_score_value"] = pd.to_numeric(frame["score"], errors="coerce").fillna(0.0)
     frame["情绪分"] = frame["_score_value"]
-    frame["新闻内容（中文翻译）"] = frame.apply(
+    frame["主要内容（中文翻译）"] = frame.apply(
         lambda row: build_chinese_news_summary(
             row.get("title", ""),
             row.get("summary", ""),
@@ -1001,6 +1398,146 @@ def format_home_news_briefing(news: pd.DataFrame, limit: int = 12) -> pd.DataFra
     )
     frame["链接"] = frame["link"]
     return frame[columns]
+
+
+def render_home_news_briefing(
+    news: pd.DataFrame,
+    page_size: int = HOME_NEWS_PAGE_SIZE,
+    page_state_key: str = "home_news_page",
+    empty_message: str = "当前没有可展示的相关新闻。",
+) -> None:
+    if news.empty:
+        st.info(empty_message)
+        return
+
+    total_items = len(news)
+    total_pages = max(1, int(np.ceil(total_items / page_size)))
+    current_page = int(st.session_state.get(page_state_key, 0))
+    current_page = min(max(current_page, 0), total_pages - 1)
+    st.session_state[page_state_key] = current_page
+
+    left, middle, right = st.columns([1, 2, 1])
+    with left:
+        if st.button("上一页", disabled=current_page <= 0, key=f"{page_state_key}_prev"):
+            st.session_state[page_state_key] = max(current_page - 1, 0)
+            st.rerun()
+    with middle:
+        st.markdown(
+            f"<div style='text-align:center;color:#667789;padding-top:0.45rem;'>第 {current_page + 1} / {total_pages} 页 · 共 {total_items} 条相关新闻</div>",
+            unsafe_allow_html=True,
+        )
+    with right:
+        if st.button("下一页", disabled=current_page >= total_pages - 1, key=f"{page_state_key}_next"):
+            st.session_state[page_state_key] = min(current_page + 1, total_pages - 1)
+            st.rerun()
+
+    home_news = format_home_news_briefing(news, limit=page_size, offset=current_page * page_size)
+    if home_news.empty:
+        st.info("当前页没有可展示的相关新闻。")
+        return
+
+    st.markdown(
+        """
+        <style>
+        .home-news-item {
+            border: 1px solid #D7DEE8;
+            border-left: 4px solid #2F4858;
+            border-radius: 8px;
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.75rem;
+            background: #FFFFFF;
+        }
+        .home-news-main {
+            color: #17212B;
+            font-size: 0.98rem;
+            line-height: 1.62;
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            word-break: break-word;
+        }
+        .home-news-impact {
+            margin-top: 0.55rem;
+            color: #364B5F;
+            line-height: 1.55;
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            word-break: break-word;
+        }
+        .home-news-meta {
+            margin-top: 0.55rem;
+            color: #667789;
+            font-size: 0.84rem;
+            line-height: 1.45;
+            white-space: normal;
+            word-break: break-word;
+        }
+        .home-news-meta a {
+            color: #1F6FEB;
+            text-decoration: none;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for _, row in home_news.iterrows():
+        main_text = escape(str(row.get("主要内容（中文翻译）", "")))
+        impact = escape(str(row.get("对白银影响", "")))
+        category = escape(str(row.get("类别", "")))
+        source = escape(str(row.get("来源", "")))
+        published = escape(str(row.get("时间", "")))
+        keyword = escape(str(row.get("触发词", "")))
+        score = pd.to_numeric(row.get("情绪分", np.nan), errors="coerce")
+        score_text = "" if pd.isna(score) else f"{float(score):.3f}"
+        link = str(row.get("链接", "") or "").strip()
+        link_html = f' · <a href="{escape(link)}" target="_blank" rel="noopener noreferrer">原文链接</a>' if link else ""
+
+        st.markdown(
+            f"""
+            <article class="home-news-item">
+                <div class="home-news-main">{main_text}</div>
+                <div class="home-news-impact"><strong>对白银影响：</strong>{impact}</div>
+                <div class="home-news-meta">{published} · {category} · {source} · 触发词：{keyword} · 情绪分：{score_text}{link_html}</div>
+            </article>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_categorized_home_news(news: pd.DataFrame) -> None:
+    if news.empty:
+        st.info("当前没有可展示的相关新闻。")
+        return
+
+    if "category" not in news.columns:
+        news = news.copy()
+        news["category"] = "宏观/其他"
+
+    industrial_news = news[news["category"] == "工业相关"].copy()
+    other_news = news[news["category"] != "工业相关"].copy()
+
+    industrial_tab, other_tab = st.tabs(
+        [
+            f"工业相关新闻 ({len(industrial_news)})",
+            f"宏观/其他新闻 ({len(other_news)})",
+        ]
+    )
+    with industrial_tab:
+        render_home_news_briefing(
+            industrial_news,
+            page_size=HOME_NEWS_PAGE_SIZE,
+            page_state_key="home_industrial_news_page",
+            empty_message="当前没有匹配到工业、光伏、电子、半导体、电动车或供需缺口相关新闻。",
+        )
+    with other_tab:
+        render_home_news_briefing(
+            other_news,
+            page_size=HOME_NEWS_PAGE_SIZE,
+            page_state_key="home_other_news_page",
+            empty_message="当前没有可展示的宏观/其他相关新闻。",
+        )
 
 
 def build_price_chart(filtered: pd.DataFrame) -> go.Figure:
@@ -1211,7 +1748,8 @@ def sidebar_controls() -> dict[str, bool | float | int | str]:
     reward_risk = st.sidebar.slider("目标 / 风险比", 0.50, 5.00, 2.00, 0.10)
 
     st.sidebar.divider()
-    auto_refresh = st.sidebar.toggle("自动刷新最新数据", value=False)
+    live_quote_refresh = st.sidebar.toggle("秒级刷新白银报价", value=True)
+    st.sidebar.caption(f"白银实时报价每 {LIVE_QUOTE_REFRESH_SECONDS} 秒刷新；行情、FRED 和 RSS 仍走缓存，避免页面过慢。")
     if st.sidebar.button("刷新缓存"):
         st.cache_data.clear()
         st.rerun()
@@ -1229,13 +1767,34 @@ def sidebar_controls() -> dict[str, bool | float | int | str]:
         "min_velocity": min_velocity,
         "stop_mult": stop_mult,
         "reward_risk": reward_risk,
-        "auto_refresh": auto_refresh,
+        "live_quote_refresh": live_quote_refresh,
     }
 
 
 def render_warnings(warnings: Iterable[str]) -> None:
     for warning in warnings:
         st.warning(warning)
+
+
+live_quote_fragment = (
+    st.fragment(run_every=LIVE_QUOTE_REFRESH_SECONDS) if hasattr(st, "fragment") else (lambda function: function)
+)
+
+
+@live_quote_fragment
+def render_live_silver_quote(enabled: bool, fallback_quote: float) -> None:
+    if not enabled:
+        return
+
+    quote = fetch_latest_silver_price()
+    display_price = quote.price if quote.price is not None else fallback_quote
+    c1, c2, c3 = st.columns([1.1, 1.0, 1.6])
+    c1.metric("秒级白银报价", f"{float(display_price):,.2f}")
+    c2.metric("报价源", quote.source)
+    c3.metric("报价更新时间", format_quote_timestamp(quote.timestamp))
+    st.caption(f"该报价区块每 {LIVE_QUOTE_REFRESH_SECONDS} 秒独立刷新；策略计算仍使用当前历史窗口和缓存行情。")
+    if quote.warning:
+        st.warning(quote.warning)
 
 
 def render_trade_tab(
@@ -1311,7 +1870,7 @@ def render_sentiment_tab(news: pd.DataFrame, sentiment_daily: pd.DataFrame, macr
     st.subheader("情绪因子：新闻标题 -> VADER -> 日均值 -> Z-Score")
     st.markdown(
         f"""
-        1. 从 CNBC、Yahoo Finance、Google News RSS 抓取包含 `Silver / Fed / War` 的标题。
+        1. 从 CNBC、Yahoo Finance、Google News RSS 抓取包含 `Silver / Fed / War / 工业需求 / 光伏 / 电子 / 半导体` 的标题。
         2. 使用 VADER `compound` 得到每条标题的情绪分，范围为 `-1` 到 `1`。
         3. 按日期求平均，得到 `sentiment_raw`。
         4. 对 `sentiment_raw` 做 EWM Z-Score，得到 `z_sentiment`（近期权重更高）。
@@ -1347,10 +1906,11 @@ def render_dollar_tab(macro: pd.DataFrame) -> None:
     st.subheader("美元指数因子：美元走强通常压制白银")
     st.markdown(
         f"""
-        1. 使用 yfinance 获取美元指数 `{DXY_TICKER}`。
-        2. 计算日变动：`dxy_delta = pct_change(DXY) * 100`。
-        3. 对 `dxy_delta` 做 EWM Z-Score，得到 `z_dxy`。
-        4. 美元因子采用反向符号：`dxy_factor = -{DOLLAR_WEIGHT:.2f} * z_dxy`。
+        1. 日线优先使用 FRED `{FRED_DOLLAR_INDEX}` 美元广义指数；小时线优先使用 Yahoo Chart `{DXY_TICKER}`。
+        2. 当主源不可用时，自动回退到备用源并在首页显示告警。
+        3. 计算变动：`dxy_delta = pct_change(DXY) * 100`。
+        4. 对 `dxy_delta` 做 EWM Z-Score，得到 `z_dxy`。
+        5. 美元因子采用反向符号：`dxy_factor = -{DOLLAR_WEIGHT:.2f} * z_dxy`。
         """
     )
 
@@ -1375,7 +1935,7 @@ def render_rate_tab(macro: pd.DataFrame) -> None:
     st.markdown(
         f"""
         1. 优先使用 FRED `{FRED_REAL_RATE}` 十年期实际利率。
-        2. 如果 FRED 数据不可用，则回退使用 yfinance `{TNX_TICKER}` 的十年期美债收益率变动。
+        2. 名义 10 年期收益率优先使用 FRED `{FRED_TREASURY_10Y}`；小时线或 FRED 不可用时回退 Yahoo Chart `{TNX_TICKER}`。
         3. 计算 `rate_delta`，再做 EWM Z-Score 得到 `z_rate`。
         4. 利率因子采用反向符号：`rate_factor = -{RATE_WEIGHT:.2f} * z_rate`。
         """
@@ -1520,19 +2080,16 @@ def main() -> None:
     st.set_page_config(page_title=f"{APP_NAME} | 白银宏观卡尔曼交易终端", page_icon="Ag", layout="wide")
     controls = sidebar_controls()
 
-    if controls["auto_refresh"]:
-        st.sidebar.caption("刷新浏览器页面即可重新运行；实时报价缓存 60 秒。")
-
     st.title("白银宏观卡尔曼交易终端")
     st.caption(
-        "以 RSS 情绪、美元指数变动、实际利率或美债收益率变动作为宏观控制输入，"
+        "以 RSS 情绪、工业需求新闻、FRED / Yahoo Chart 行情、实际利率或美债收益率变动作为宏观控制输入，"
         "对 SI=F 白银期货价格状态进行二维卡尔曼滤波，并生成多空入场窗口。"
     )
 
-    with st.spinner("正在加载行情数据、FRED 实际利率和 RSS 情绪数据..."):
+    with st.spinner("正在加载 Yahoo Chart / FRED 行情、实际利率和 RSS 情绪数据..."):
         market = fetch_market_data(str(controls["period"]), str(controls["interval"]))
         silver_ohlc = fetch_silver_ohlc(str(controls["period"]), str(controls["interval"]))
-        latest_price, latest_warning = fetch_latest_silver_price()
+        latest_quote_result = fetch_latest_silver_price()
 
         if market.data.empty:
             render_warnings(market.warnings)
@@ -1541,11 +2098,11 @@ def main() -> None:
         start = market.data.index.min().to_pydatetime() - timedelta(days=10)
         end = market.data.index.max().to_pydatetime() + timedelta(days=1)
         real_rate = fetch_real_rate(start, end)
-        news = fetch_news_sentiment()
+        news = fetch_news_sentiment(max_items=NEWS_FETCH_ITEMS_PER_SOURCE)
 
-    all_warnings = market.warnings + silver_ohlc.warnings + real_rate.warnings + news.warnings
-    if latest_warning:
-        all_warnings.append(latest_warning)
+    all_warnings = dedupe_warnings(market.warnings + silver_ohlc.warnings + real_rate.warnings + news.warnings)
+    if latest_quote_result.warning:
+        all_warnings = dedupe_warnings(all_warnings + [latest_quote_result.warning])
 
     sentiment_daily = daily_sentiment(news.data)
     macro = compute_macro_score(
@@ -1572,7 +2129,7 @@ def main() -> None:
 
     latest_row = filtered.iloc[-1]
     latest_macro = macro.reindex(filtered.index).iloc[-1]
-    latest_quote = latest_price if latest_price is not None else latest_row["observed"]
+    latest_quote = latest_quote_result.price if latest_quote_result.price is not None else latest_row["observed"]
     signal_frame = build_signal_frame(
         filtered=filtered,
         macro=macro,
@@ -1586,8 +2143,10 @@ def main() -> None:
     opportunities = build_opportunity_table(signal_frame)
     current_plan = current_trade_plan(signal_frame, float(latest_quote))
 
+    render_live_silver_quote(bool(controls["live_quote_refresh"]), float(latest_quote))
+
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("SI=F 最新报价", f"{latest_quote:,.2f}")
+    c1.metric("策略参考报价", f"{latest_quote:,.2f}")
     c2.metric("当前信号", str(current_plan["方向"]))
     c3.metric("信号强度", f"{float(current_plan['信号强度']):.0f}%")
     c4.metric("卡尔曼价格", f"{latest_row['kalman_price']:,.2f}")
@@ -1613,15 +2172,7 @@ def main() -> None:
             render_warnings(all_warnings)
 
     st.subheader("相关新闻中文翻译与白银影响")
-    home_news = format_home_news_briefing(news.data, limit=12)
-    if home_news.empty:
-        st.info("当前没有可展示的相关新闻。")
-    else:
-        st.dataframe(
-            home_news.style.format({"情绪分": "{:.3f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+    render_categorized_home_news(news.data)
 
     tabs = st.tabs(["交易机会", "情绪因子", "美元指数因子", "利率因子", "综合分拆解", "卡尔曼动量", "原始数据"])
     with tabs[0]:
