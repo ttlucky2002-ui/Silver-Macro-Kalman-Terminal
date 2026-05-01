@@ -488,7 +488,6 @@ def fetch_yfinance_silver_ohlc(period: str, interval: str) -> FetchResult:
     return FetchResult(cleaned, [])
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def fetch_market_data(period: str, interval: str) -> FetchResult:
     warnings: list[str] = []
     silver = fetch_yahoo_close_frame(SILVER_TICKER, SILVER_TICKER, period, interval)
@@ -547,7 +546,6 @@ def fetch_market_data(period: str, interval: str) -> FetchResult:
     return FetchResult(result, dedupe_warnings(warnings))
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def fetch_silver_ohlc(period: str, interval: str) -> FetchResult:
     warnings: list[str] = []
     _, period_warning = normalize_yahoo_period(period, interval)
@@ -606,7 +604,6 @@ def calculate_adx(ohlc: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx.replace([np.inf, -np.inf], np.nan)
 
 
-@st.cache_data(ttl=LIVE_QUOTE_REFRESH_SECONDS, show_spinner=False)
 def fetch_latest_silver_price() -> QuoteResult:
     primary_warning: str | None = None
     try:
@@ -646,7 +643,6 @@ def fetch_latest_silver_price() -> QuoteResult:
     return QuoteResult(None, None, "不可用", "白银实时报价暂不可用。")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_rate(start: datetime, end: datetime) -> FetchResult:
     return fetch_fred_series(FRED_REAL_RATE, start, end, FRED_REAL_RATE)
 
@@ -661,7 +657,6 @@ def parse_entry_date(entry: dict) -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC").tz_convert(None)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def fetch_news_sentiment(max_items: int = NEWS_FETCH_ITEMS_PER_SOURCE) -> FetchResult:
     warnings: list[str] = []
     analyzer = SentimentIntensityAnalyzer()
