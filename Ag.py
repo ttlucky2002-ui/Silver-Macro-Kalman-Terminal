@@ -35,6 +35,8 @@ DATA_HEADERS = {
         "(local research dashboard; contact: local)"
     )
 }
+FRED_TIMEOUT_SECONDS = 30
+FRED_RETRY_COUNT = 2
 INTRADAY_MAX_PERIOD = "2y"
 LIVE_QUOTE_REFRESH_SECONDS = 2
 HOME_NEWS_PAGE_SIZE = 10
@@ -342,6 +344,7 @@ def fetch_fred_series(
     start: datetime,
     end: datetime,
     column_name: str | None = None,
+    emit_warnings: bool = True,
 ) -> FetchResult:
     output_name = column_name or series_id
     params = {
@@ -350,23 +353,30 @@ def fetch_fred_series(
         "coed": end.strftime("%Y-%m-%d"),
     }
 
-    try:
-        response = requests.get(FRED_CSV_URL, params=params, headers=DATA_HEADERS, timeout=15)
-        response.raise_for_status()
-        data = pd.read_csv(StringIO(response.text), na_values=["."])
-    except Exception as exc:
-        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 下载失败：{exc}"])
+    last_error: Exception | None = None
+    for _ in range(FRED_RETRY_COUNT):
+        try:
+            response = requests.get(FRED_CSV_URL, params=params, headers=DATA_HEADERS, timeout=FRED_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            data = pd.read_csv(StringIO(response.text), na_values=["."])
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        warning = f"FRED {series_id} 暂时不可用，已使用备用利率/行情源。" if emit_warnings else ""
+        detail = f" 原始错误：{last_error}" if emit_warnings and last_error else ""
+        return FetchResult(pd.DataFrame(), [f"{warning}{detail}"] if warning else [])
 
     date_column = "DATE" if "DATE" in data.columns else "observation_date"
     if data.empty or date_column not in data.columns or series_id not in data.columns:
-        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 未返回可解析数据。"])
+        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 未返回可解析数据。"] if emit_warnings else [])
 
     data[date_column] = pd.to_datetime(data[date_column], errors="coerce")
     data[series_id] = pd.to_numeric(data[series_id], errors="coerce")
     data = data.dropna(subset=[date_column]).set_index(date_column)[[series_id]]
     data = normalize_index(data.rename(columns={series_id: output_name}))
     if data[output_name].dropna().empty:
-        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 数据为空。"])
+        return FetchResult(pd.DataFrame(), [f"FRED {series_id} 数据为空。"] if emit_warnings else [])
 
     return FetchResult(data, [])
 
@@ -505,26 +515,15 @@ def fetch_market_data(period: str, interval: str) -> FetchResult:
     start = result.index.min().to_pydatetime() - timedelta(days=10)
     end = result.index.max().to_pydatetime() + timedelta(days=1)
 
-    if interval == "1d":
-        dollar = fetch_fred_series(FRED_DOLLAR_INDEX, start, end, DXY_TICKER)
-        rate = fetch_fred_series(FRED_TREASURY_10Y, start, end, TNX_TICKER)
+    dollar = fetch_yahoo_close_frame(DXY_TICKER, DXY_TICKER, period, interval)
+    rate = fetch_yahoo_close_frame(TNX_TICKER, TNX_TICKER, period, interval)
 
-        if dollar.data.empty:
-            warnings.extend(dollar.warnings)
-            dollar = fetch_yahoo_close_frame(DXY_TICKER, DXY_TICKER, period, interval)
-        if rate.data.empty:
-            warnings.extend(rate.warnings)
-            rate = fetch_yahoo_close_frame(TNX_TICKER, TNX_TICKER, period, interval)
-    else:
-        dollar = fetch_yahoo_close_frame(DXY_TICKER, DXY_TICKER, period, interval)
-        rate = fetch_yahoo_close_frame(TNX_TICKER, TNX_TICKER, period, interval)
-
-        if dollar.data.empty:
-            warnings.extend(dollar.warnings)
-            dollar = fetch_fred_series(FRED_DOLLAR_INDEX, start, end, DXY_TICKER)
-        if rate.data.empty:
-            warnings.extend(rate.warnings)
-            rate = fetch_fred_series(FRED_TREASURY_10Y, start, end, TNX_TICKER)
+    if dollar.data.empty and interval == "1d":
+        warnings.extend(dollar.warnings)
+        dollar = fetch_fred_series(FRED_DOLLAR_INDEX, start, end, DXY_TICKER, emit_warnings=False)
+    if rate.data.empty and interval == "1d":
+        warnings.extend(rate.warnings)
+        rate = fetch_fred_series(FRED_TREASURY_10Y, start, end, TNX_TICKER, emit_warnings=False)
 
     warnings.extend(dollar.warnings)
     warnings.extend(rate.warnings)
@@ -644,7 +643,7 @@ def fetch_latest_silver_price() -> QuoteResult:
 
 
 def fetch_real_rate(start: datetime, end: datetime) -> FetchResult:
-    return fetch_fred_series(FRED_REAL_RATE, start, end, FRED_REAL_RATE)
+    return fetch_fred_series(FRED_REAL_RATE, start, end, FRED_REAL_RATE, emit_warnings=False)
 
 
 def parse_entry_date(entry: dict) -> pd.Timestamp:
@@ -1901,8 +1900,8 @@ def render_dollar_tab(macro: pd.DataFrame) -> None:
     st.subheader("美元指数因子：美元走强通常压制白银")
     st.markdown(
         f"""
-        1. 日线优先使用 FRED `{FRED_DOLLAR_INDEX}` 美元广义指数；小时线优先使用 Yahoo Chart `{DXY_TICKER}`。
-        2. 当主源不可用时，自动回退到备用源并在首页显示告警。
+        1. 主源使用 Yahoo Chart `{DXY_TICKER}`，保持与市场常用 DXY 口径一致。
+        2. 日线主源不可用时，才静默回退到 FRED `{FRED_DOLLAR_INDEX}` 广义美元指数。
         3. 计算变动：`dxy_delta = pct_change(DXY) * 100`。
         4. 对 `dxy_delta` 做 EWM Z-Score，得到 `z_dxy`。
         5. 美元因子采用反向符号：`dxy_factor = -{DOLLAR_WEIGHT:.2f} * z_dxy`。
@@ -1929,8 +1928,8 @@ def render_rate_tab(macro: pd.DataFrame) -> None:
     st.subheader("利率因子：实际利率或收益率上行通常压制白银")
     st.markdown(
         f"""
-        1. 优先使用 FRED `{FRED_REAL_RATE}` 十年期实际利率。
-        2. 名义 10 年期收益率优先使用 FRED `{FRED_TREASURY_10Y}`；小时线或 FRED 不可用时回退 Yahoo Chart `{TNX_TICKER}`。
+        1. 主源使用 Yahoo Chart `{TNX_TICKER}` 的 10 年期美债收益率，避免云端 FRED 超时阻塞页面。
+        2. FRED `{FRED_REAL_RATE}` 十年期实际利率可用时作为增强输入；不可用时静默回退到名义收益率。
         3. 计算 `rate_delta`，再做 EWM Z-Score 得到 `z_rate`。
         4. 利率因子采用反向符号：`rate_factor = -{RATE_WEIGHT:.2f} * z_rate`。
         """
@@ -2077,11 +2076,11 @@ def main() -> None:
 
     st.title("白银宏观卡尔曼交易终端")
     st.caption(
-        "以 RSS 情绪、工业需求新闻、FRED / Yahoo Chart 行情、实际利率或美债收益率变动作为宏观控制输入，"
+        "以 RSS 情绪、工业需求新闻、Yahoo Chart 主行情、FRED 实际利率增强或美债收益率变动作为宏观控制输入，"
         "对 SI=F 白银期货价格状态进行二维卡尔曼滤波，并生成多空入场窗口。"
     )
 
-    with st.spinner("正在加载 Yahoo Chart / FRED 行情、实际利率和 RSS 情绪数据..."):
+    with st.spinner("正在加载 Yahoo Chart 主行情、FRED 增强利率和 RSS 情绪数据..."):
         market = fetch_market_data(str(controls["period"]), str(controls["interval"]))
         silver_ohlc = fetch_silver_ohlc(str(controls["period"]), str(controls["interval"]))
         latest_quote_result = fetch_latest_silver_price()
