@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape, unescape
 from io import StringIO
+import json
+import os
 import re
 from typing import Iterable
 from urllib.parse import quote
@@ -28,6 +30,7 @@ FRED_TREASURY_10Y = "DGS10"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 TRANSLATION_URL = "https://api.mymemory.translated.net/get"
 GOOGLE_TRANSLATION_URL = "https://translate.googleapis.com/translate_a/single"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 DATA_HEADERS = {
     "User-Agent": (
@@ -37,6 +40,8 @@ DATA_HEADERS = {
 }
 FRED_TIMEOUT_SECONDS = 30
 FRED_RETRY_COUNT = 2
+AI_ANALYSIS_MODEL = "gpt-5-mini"
+AI_NEWS_LIMIT_PER_CATEGORY = 18
 INTRADAY_MAX_PERIOD = "2y"
 LIVE_QUOTE_REFRESH_SECONDS = 2
 HOME_NEWS_PAGE_SIZE = 10
@@ -401,6 +406,24 @@ def dedupe_warnings(warnings: Iterable[str]) -> list[str]:
             result.append(warning)
             seen.add(warning)
     return result
+
+
+def get_config_value(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def get_openai_api_key() -> str:
+    return get_config_value("OPENAI_API_KEY").strip()
+
+
+def get_openai_model() -> str:
+    return get_config_value("OPENAI_MODEL", AI_ANALYSIS_MODEL).strip() or AI_ANALYSIS_MODEL
 
 
 def yahoo_market_timestamp(meta: dict[str, object]) -> datetime | None:
@@ -1166,6 +1189,150 @@ def build_chinese_news_summary(title: object, summary: object, keyword: object) 
     return f"标题：{translated_title}"
 
 
+def safe_number(value: object, digits: int = 3) -> float | None:
+    try:
+        if pd.isna(value):
+            return None
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
+def format_news_for_ai(news: pd.DataFrame, category: str, limit: int = AI_NEWS_LIMIT_PER_CATEGORY) -> list[dict[str, object]]:
+    if news.empty or "category" not in news.columns:
+        return []
+
+    frame = news[news["category"] == category].head(limit).copy()
+    rows: list[dict[str, object]] = []
+    for _, row in frame.iterrows():
+        score = safe_number(row.get("score"), digits=3)
+        published = row.get("published", "")
+        if hasattr(published, "strftime"):
+            published = published.strftime("%Y-%m-%d %H:%M")
+        rows.append(
+            {
+                "time": str(published),
+                "source": clean_news_text(row.get("source", ""), max_length=80),
+                "keyword": clean_news_text(row.get("keyword", ""), max_length=120),
+                "title": clean_news_text(row.get("title", ""), max_length=320),
+                "summary": clean_news_text(row.get("summary", ""), max_length=420),
+                "sentiment_score": score,
+                "silver_impact_rule_based": describe_silver_impact(
+                    row.get("title", ""),
+                    row.get("summary", ""),
+                    row.get("keyword", ""),
+                    float(score or 0.0),
+                ),
+            }
+        )
+    return rows
+
+
+def build_ai_analysis_payload(
+    macro: pd.DataFrame,
+    signal_frame: pd.DataFrame,
+    news: pd.DataFrame,
+    latest_quote: float,
+) -> dict[str, object]:
+    latest_macro = macro.iloc[-1] if not macro.empty else pd.Series(dtype=object)
+    latest_signal = signal_frame.iloc[-1] if not signal_frame.empty else pd.Series(dtype=object)
+
+    industrial_count = int((news.get("category", pd.Series(dtype=str)) == "工业相关").sum()) if not news.empty else 0
+    other_count = int((news.get("category", pd.Series(dtype=str)) != "工业相关").sum()) if not news.empty else 0
+
+    return {
+        "as_of": current_timestamp().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "market": {
+            "silver_latest_quote": safe_number(latest_quote, digits=3),
+            "silver_model_price": safe_number(latest_signal.get("kalman_price"), digits=3),
+            "hidden_velocity": safe_number(latest_signal.get("velocity"), digits=4),
+            "adx": safe_number(latest_signal.get("adx"), digits=2),
+            "signal_state": str(latest_signal.get("entry_side", "")),
+            "long_score_pct": safe_number(latest_signal.get("long_score_pct"), digits=1),
+            "short_score_pct": safe_number(latest_signal.get("short_score_pct"), digits=1),
+        },
+        "macro_factors": {
+            "U_score": safe_number(latest_macro.get("U_score"), digits=3),
+            "sentiment_factor": safe_number(latest_macro.get("sentiment_factor"), digits=3),
+            "dxy": safe_number(latest_macro.get("dxy"), digits=3),
+            "dxy_delta_pct": safe_number(latest_macro.get("dxy_delta"), digits=3),
+            "dxy_factor": safe_number(latest_macro.get("dxy_factor"), digits=3),
+            "real_rate": safe_number(latest_macro.get("real_rate"), digits=3),
+            "tnx": safe_number(latest_macro.get("tnx"), digits=3),
+            "rate_delta": safe_number(latest_macro.get("rate_delta"), digits=3),
+            "rate_factor": safe_number(latest_macro.get("rate_factor"), digits=3),
+        },
+        "news_counts": {
+            "industrial_news": industrial_count,
+            "macro_other_news": other_count,
+            "total": int(len(news)),
+        },
+        "news": {
+            "industrial": format_news_for_ai(news, "工业相关"),
+            "macro_other": format_news_for_ai(news, "宏观/其他"),
+        },
+    }
+
+
+def extract_openai_output_text(payload: dict[str, object]) -> str:
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    chunks: list[str] = []
+    for item in payload.get("output", []) if isinstance(payload.get("output"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+    return "\n\n".join(chunks).strip()
+
+
+def request_ai_fundamental_analysis(payload: dict[str, object]) -> str:
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("未配置 OPENAI_API_KEY。")
+
+    instructions = (
+        "你是一个贵金属基本面分析助手，专注白银。"
+        "请只基于用户提供的行情指标和新闻摘要分析，不要声称已经浏览原文。"
+        "输出中文 Markdown，结构包括：1) 一句话结论；2) 利多因素；3) 利空因素；"
+        "4) 工业需求线索；5) 美元/利率/地缘宏观线索；6) 未来 24-72 小时关注点；"
+        "7) 综合判断。"
+        "必须明确区分事实、推断和不确定性。不要给出确定收益承诺，不要建议满仓或自动下单。"
+    )
+    user_input = (
+        "请对以下白银行情、宏观因子和新闻池做基本面综合分析：\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+    response = requests.post(
+        OPENAI_RESPONSES_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": get_openai_model(),
+            "instructions": instructions,
+            "input": user_input,
+            "max_output_tokens": 1800,
+        },
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        detail = clean_news_text(response.text, max_length=600)
+        raise RuntimeError(f"OpenAI API 请求失败：HTTP {response.status_code}。{detail}")
+
+    result = extract_openai_output_text(response.json())
+    if not result:
+        raise RuntimeError("OpenAI API 没有返回可展示的分析文本。")
+    return result
+
+
 def contains_market_term(text: str, terms: Iterable[str]) -> bool:
     for term in terms:
         if len(term) <= 4 and term.replace(" ", "").isalpha():
@@ -1532,6 +1699,59 @@ def render_categorized_home_news(news: pd.DataFrame) -> None:
             page_state_key="home_other_news_page",
             empty_message="当前没有可展示的宏观/其他相关新闻。",
         )
+
+
+def render_ai_analysis_panel(
+    macro: pd.DataFrame,
+    signal_frame: pd.DataFrame,
+    news: pd.DataFrame,
+    latest_quote: float,
+) -> None:
+    st.subheader("AI 基本面综合分析")
+    st.caption(
+        "点击按钮后，系统会把当前行情指标、宏观因子和新闻标题/摘要发送给 OpenAI 做综合分析；"
+        "不会发送你的 API Key 或个人数据。"
+    )
+
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    if not api_key:
+        st.info("未配置 `OPENAI_API_KEY`，AI 分析模块暂不可用。配置后无需改代码即可启用。")
+        with st.expander("如何在 Streamlit Cloud 配置"):
+            st.markdown(
+                """
+                在 Streamlit Cloud 应用右下角 `Manage app` -> `Settings` -> `Secrets` 添加：
+
+                ```toml
+                OPENAI_API_KEY = "你的 OpenAI API Key"
+                OPENAI_MODEL = "gpt-5-mini"
+                ```
+
+                `OPENAI_MODEL` 可不填，默认使用 `gpt-5-mini`。
+                """
+            )
+        return
+
+    c1, c2, c3 = st.columns([1.1, 1.1, 2.4])
+    c1.metric("AI 模型", model)
+    c2.metric("新闻输入上限", f"{AI_NEWS_LIMIT_PER_CATEGORY * 2} 条")
+    c3.caption("分析结果仅供研究参考，不构成投资建议。")
+
+    if st.button("生成 / 刷新 AI 基本面分析", type="primary", key="generate_ai_analysis"):
+        payload = build_ai_analysis_payload(macro, signal_frame, news, latest_quote)
+        with st.spinner("AI 正在综合行情、工业新闻和宏观新闻..."):
+            try:
+                st.session_state["ai_fundamental_analysis"] = request_ai_fundamental_analysis(payload)
+                st.session_state["ai_fundamental_analysis_time"] = format_quote_timestamp(current_timestamp())
+            except Exception as exc:
+                st.error(f"AI 分析生成失败：{exc}")
+
+    analysis = st.session_state.get("ai_fundamental_analysis")
+    if analysis:
+        generated_at = st.session_state.get("ai_fundamental_analysis_time", "")
+        if generated_at:
+            st.caption(f"生成时间：{generated_at}")
+        st.markdown(str(analysis))
 
 
 def build_price_chart(filtered: pd.DataFrame) -> go.Figure:
@@ -2166,6 +2386,8 @@ def main() -> None:
             render_warnings(all_warnings)
 
     st.subheader("相关新闻中文翻译与白银影响")
+    render_ai_analysis_panel(macro, signal_frame, news.data, float(latest_quote))
+    st.divider()
     render_categorized_home_news(news.data)
 
     tabs = st.tabs(["交易机会", "情绪因子", "美元指数因子", "利率因子", "综合分拆解", "卡尔曼动量", "原始数据"])
